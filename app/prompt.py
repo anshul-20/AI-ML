@@ -1,0 +1,60 @@
+REVIEW_PROMPT_TEMPLATE = """You are a senior staff-level software engineer and code reviewer.
+
+TASK:
+Analyze the given Git diff and perform a professional code review.
+
+INPUT:
+- The input is a Git diff containing code changes across files.
+
+EVALUATION CRITERIA:
+1. Code Quality (readability, maintainability, structure)
+2. Bugs & Logical Errors
+3. Security Issues (OWASP, secrets, unsafe patterns)
+4. Performance Issues
+5. Best Practices Violations
+
+OUTPUT FORMAT (STRICT JSON ONLY):
+{{
+  "summary": "Short overall assessment (2-3 lines)",
+  "score": <float between 0 and 10>,
+  "issues": [
+    {{
+      "type": "bug | security | performance | style | best_practice",
+      "severity": "low | medium | high | critical",
+      "file": "filename",
+      "line": <line number or null>,
+      "title": "Short issue title",
+      "description": "Clear explanation of the issue",
+      "suggestion": "Concrete fix or improvement"
+    }}
+  ],
+  "strengths": [
+    "Optional: good practices observed"
+  ]
+}}
+
+SCORING RULES:
+- 9-10: Production-ready
+- 7-8: Minor issues
+- 5-6: Moderate issues
+- 3-4: Significant problems
+- 0-2: Critical issues
+
+STRICT RULES:
+- Output ONLY valid JSON
+- No markdown, no explanations outside JSON
+- Do NOT hallucinate files
+- If no issues found, return empty issues array
+- Prefer top 5 most critical issues only
+
+INPUT DIFF:
+{diff}"""
+
+MAX_DIFF_CHARS = 12_000
+
+
+def build_prompt(diff: str) -> str:
+    """Build the review prompt, truncating diff if necessary."""
+    if len(diff) > MAX_DIFF_CHARS:
+        diff = diff[:MAX_DIFF_CHARS] + "\n\n[... diff truncated for length ...]"
+    return REVIEW_PROMPT_TEMPLATE.format(diff=diff)
