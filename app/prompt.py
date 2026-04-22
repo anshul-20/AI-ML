@@ -42,7 +42,7 @@ SCORING RULES:
 
 STRICT RULES:
 - Output ONLY valid JSON
-- No markdown, no explanations outside JSON
+- No markdown,no explanations outside the JSON
 - Do NOT hallucinate files
 - If no issues found, return empty issues array
 - Prefer top 5 most critical issues only
