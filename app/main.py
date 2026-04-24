@@ -6,7 +6,8 @@ Features: Code Review, Quality Gate, Multi-Agent Review, Docs Generator, Feedbac
 import logging
 import time
 import uuid
-
+import os
+from fastapi.responses import JSONResponse
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
@@ -28,6 +29,8 @@ from app.feedback import handle_feedback, get_feedback_stats
 setup_logging()
 logger = logging.getLogger(__name__)
 
+AI_REVIEW_SCERET  = os.getenv("AI_REVIEW_SCERET")
+
 app = FastAPI(
     title="AI-Augmented CI/CD System",
     description="End-to-end AI code review pipeline powered entirely by OpenAI GPT: review → gate → docs → feedback",
@@ -40,6 +43,34 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+#-----------------Middleware--------------------------------------
+# @app.middleware("http")
+# async def token_auth_middleware(request: Request, call_next):
+#     # Skip auth for health check
+#     if request.url.path == "/health":
+#         return await call_next(request)
+    
+#     token = request.headers.get("X-API-Token")
+#     expected = os.getenv("AI_REVIEW_SCERET")
+    
+#     if expected and token != expected:
+#         return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
+#     return await call_next(request)
+@app.middleware("http")
+async def token_auth_middleware(request: Request, call_next):
+    # Always allow health checks (GitHub Actions checks this first)
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    # If token is configured on server, enforce it
+    if AI_REVIEW_SCERET:
+        incoming = request.headers.get("X-API-Token", "")
+        if incoming != AI_REVIEW_SCERET:
+            logger.warning("Unauthorized request | path=%s", request.url.path)
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    return await call_next(request)
 
 
 # ── Request correlation middleware ───────────────────────────────────────────
@@ -66,7 +97,6 @@ def health_check():
 
 
 # ── GitHub Integrations ──────────────────────────────────────────────────────
-import os
 
 async def post_github_pr_comment(repo_name: str, pr_number: int, comment_body: str):
     token = os.getenv("GITHUB_TOKEN")
@@ -108,155 +138,155 @@ async def set_github_commit_status(repo_name: str, commit_sha: str, state: str, 
 
 # ── Webhooks ─────────────────────────────────────────────────────────────────
 
-@app.post("/webhook/github", tags=["Webhooks"])
-async def github_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Handle GitHub Pull Request webhooks."""
-    event = request.headers.get("x-github-event")
-    if event != "pull_request":
-        # Ignore other events or ping
-        return {"detail": f"Ignoring event: {event}"}
+# @app.post("/webhook/github", tags=["Webhooks"])
+# async def github_webhook(request: Request, background_tasks: BackgroundTasks):
+#     """Handle GitHub Pull Request webhooks."""
+#     event = request.headers.get("x-github-event")
+#     if event != "pull_request":
+#         # Ignore other events or ping
+#         return {"detail": f"Ignoring event: {event}"}
         
-    payload = await request.json()
-    action = payload.get("action")
-    if action not in ["opened", "synchronize", "reopened"]:
-        return {"detail": f"Ignoring PR action: {action}"}
+#     payload = await request.json()
+#     action = payload.get("action")
+#     if action not in ["opened", "synchronize", "reopened"]:
+#         return {"detail": f"Ignoring PR action: {action}"}
         
-    repo_name = payload.get("repository", {}).get("full_name", "unknown/repo")
-    pr_number = payload.get("pull_request", {}).get("number", 0)
-    diff_url = payload.get("pull_request", {}).get("diff_url")
-    commit_sha = payload.get("pull_request", {}).get("head", {}).get("sha")
+#     repo_name = payload.get("repository", {}).get("full_name", "unknown/repo")
+#     pr_number = payload.get("pull_request", {}).get("number", 0)
+#     diff_url = payload.get("pull_request", {}).get("diff_url")
+#     commit_sha = payload.get("pull_request", {}).get("head", {}).get("sha")
     
-    if not diff_url:
-        raise HTTPException(status_code=400, detail="No diff_url found in payload")
+#     if not diff_url:
+#         raise HTTPException(status_code=400, detail="No diff_url found in payload")
         
-    logger.info(f"GitHub Webhook received: repo={repo_name} pr={pr_number}")
+#     logger.info(f"GitHub Webhook received: repo={repo_name} pr={pr_number}")
     
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(diff_url)
-        diff_text = resp.text
+#     async with httpx.AsyncClient() as client:
+#         resp = await client.get(diff_url)
+#         diff_text = resp.text
         
-    if not diff_text.strip():
-        logger.warning(f"Empty diff for PR {pr_number}")
-        return {"detail": "Empty diff"}
+#     if not diff_text.strip():
+#         logger.warning(f"Empty diff for PR {pr_number}")
+#         return {"detail": "Empty diff"}
 
-    # Step 1: Code review
-    review = await perform_review(diff_text)
+#     # Step 1: Code review
+#     review = await perform_review(diff_text)
     
-    # Step 2: Multi-agent
-    multi = await run_multi_agent_review(diff_text)
+#     # Step 2: Multi-agent
+#     multi = await run_multi_agent_review(diff_text)
     
-    # Step 3: Quality gate
-    gate_req = GateRequest(
-        ai_score=review.score,
-        issues=[i.model_dump() for i in review.issues],
-        test_coverage=80.0,
-        lint_errors=0,
-    )
-    gate = await evaluate_gate(gate_req)
+#     # Step 3: Quality gate
+#     gate_req = GateRequest(
+#         ai_score=review.score,
+#         issues=[i.model_dump() for i in review.issues],
+#         test_coverage=80.0,
+#         lint_errors=0,
+#     )
+#     gate = await evaluate_gate(gate_req)
     
-    # Step 4: Docs
-    docs = await generate_docs(DocsRequest(diff=diff_text))
+#     # Step 4: Docs
+#     docs = await generate_docs(DocsRequest(diff=diff_text))
 
-    logger.info(f"GitHub PR {pr_number} full pipeline completed. Score: {review.score}")
+#     logger.info(f"GitHub PR {pr_number} full pipeline completed. Score: {review.score}")
     
-    # Format Comment
-    comment_body = f"## 🤖 AI Code Review\n\n"
-    comment_body += f"**Score:** {review.score}/10.0\n"
-    comment_body += f"**Quality Gate:** {gate.status}\n\n"
-    comment_body += f"### 📊 Summary\n{review.summary}\n\n"
+#     # Format Comment
+#     comment_body = f"## 🤖 AI Code Review\n\n"
+#     comment_body += f"**Score:** {review.score}/10.0\n"
+#     comment_body += f"**Quality Gate:** {gate.status}\n\n"
+#     comment_body += f"### 📊 Summary\n{review.summary}\n\n"
     
-    if review.issues:
-        comment_body += "### 🚨 Issues\n"
-        for issue in review.issues:
-            comment_body += f"- **{issue.title}** ({issue.severity}): {issue.description}\n"
+#     if review.issues:
+#         comment_body += "### 🚨 Issues\n"
+#         for issue in review.issues:
+#             comment_body += f"- **{issue.title}** ({issue.severity}): {issue.description}\n"
             
-    if review.strengths:
-        comment_body += "### ✨ Strengths\n"
-        for strength in review.strengths:
-            comment_body += f"- {strength}\n"
+#     if review.strengths:
+#         comment_body += "### ✨ Strengths\n"
+#         for strength in review.strengths:
+#             comment_body += f"- {strength}\n"
             
-    comment_body += "\n---\n*Generated by AI-Augmented CI/CD System*"
+#     comment_body += "\n---\n*Generated by AI-Augmented CI/CD System*"
     
-    # Post comment and status using background tasks
-    background_tasks.add_task(post_github_pr_comment, repo_name, pr_number, comment_body)
+#     # Post comment and status using background tasks
+#     background_tasks.add_task(post_github_pr_comment, repo_name, pr_number, comment_body)
     
-    if commit_sha:
-        state = "success" if gate.status == "PASS" else "failure"
-        desc = "AI Code Review Passed" if state == "success" else f"AI Code Review Failed: Score {review.score}"
-        background_tasks.add_task(set_github_commit_status, repo_name, commit_sha, state, desc)
+#     if commit_sha:
+#         state = "success" if gate.status == "PASS" else "failure"
+#         desc = "AI Code Review Passed" if state == "success" else f"AI Code Review Failed: Score {review.score}"
+#         background_tasks.add_task(set_github_commit_status, repo_name, commit_sha, state, desc)
     
-    return {
-        "status": "success",
-        "repo": repo_name,
-        "pr_number": pr_number,
-        "review": review.model_dump(),
-        "multi_agent_review": multi.model_dump(),
-        "quality_gate": gate.model_dump(),
-        "documentation": docs.model_dump()
-    }
+#     return {
+#         "status": "success",
+#         "repo": repo_name,
+#         "pr_number": pr_number,
+#         "review": review.model_dump(),
+#         "multi_agent_review": multi.model_dump(),
+#         "quality_gate": gate.model_dump(),
+#         "documentation": docs.model_dump()
+#     }
 
 
-@app.post("/webhook/gitlab", tags=["Webhooks"])
-async def gitlab_webhook(request: Request):
-    """Handle GitLab Merge Request webhooks."""
-    event = request.headers.get("x-gitlab-event")
-    if event != "Merge Request Hook":
-        return {"detail": f"Ignoring event: {event}"}
+# @app.post("/webhook/gitlab", tags=["Webhooks"])
+# async def gitlab_webhook(request: Request):
+#     """Handle GitLab Merge Request webhooks."""
+#     event = request.headers.get("x-gitlab-event")
+#     if event != "Merge Request Hook":
+#         return {"detail": f"Ignoring event: {event}"}
         
-    payload = await request.json()
-    action = payload.get("object_attributes", {}).get("action")
-    if action not in ["open", "update", "reopen"]:
-        return {"detail": f"Ignoring MR action: {action}"}
+#     payload = await request.json()
+#     action = payload.get("object_attributes", {}).get("action")
+#     if action not in ["open", "update", "reopen"]:
+#         return {"detail": f"Ignoring MR action: {action}"}
         
-    repo_name = payload.get("project", {}).get("path_with_namespace", "unknown/repo")
-    mr_iid = payload.get("object_attributes", {}).get("iid", 0)
+#     repo_name = payload.get("project", {}).get("path_with_namespace", "unknown/repo")
+#     mr_iid = payload.get("object_attributes", {}).get("iid", 0)
     
-    web_url = payload.get("project", {}).get("web_url")
-    if not web_url:
-        raise HTTPException(status_code=400, detail="No web_url found in payload")
+#     web_url = payload.get("project", {}).get("web_url")
+#     if not web_url:
+#         raise HTTPException(status_code=400, detail="No web_url found in payload")
         
-    # GitLab diff URL: project_url/-/merge_requests/iid.diff
-    diff_url = f"{web_url}/-/merge_requests/{mr_iid}.diff"
+#     # GitLab diff URL: project_url/-/merge_requests/iid.diff
+#     diff_url = f"{web_url}/-/merge_requests/{mr_iid}.diff"
     
-    logger.info(f"GitLab Webhook received: repo={repo_name} mr={mr_iid}")
+#     logger.info(f"GitLab Webhook received: repo={repo_name} mr={mr_iid}")
     
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(diff_url)
-        diff_text = resp.text
+#     async with httpx.AsyncClient() as client:
+#         resp = await client.get(diff_url)
+#         diff_text = resp.text
         
-    if not diff_text.strip():
-        logger.warning(f"Empty diff for MR {mr_iid}")
-        return {"detail": "Empty diff"}
+#     if not diff_text.strip():
+#         logger.warning(f"Empty diff for MR {mr_iid}")
+#         return {"detail": "Empty diff"}
 
-    # Step 1: Code review
-    review = await perform_review(diff_text)
+#     # Step 1: Code review
+#     review = await perform_review(diff_text)
     
-    # Step 2: Multi-agent
-    multi = await run_multi_agent_review(diff_text)
+#     # Step 2: Multi-agent
+#     multi = await run_multi_agent_review(diff_text)
     
-    # Step 3: Quality gate
-    gate_req = GateRequest(
-        ai_score=review.score,
-        issues=[i.model_dump() for i in review.issues],
-        test_coverage=80.0,
-        lint_errors=0,
-    )
-    gate = await evaluate_gate(gate_req)
+#     # Step 3: Quality gate
+#     gate_req = GateRequest(
+#         ai_score=review.score,
+#         issues=[i.model_dump() for i in review.issues],
+#         test_coverage=80.0,
+#         lint_errors=0,
+#     )
+#     gate = await evaluate_gate(gate_req)
     
-    # Step 4: Docs
-    docs = await generate_docs(DocsRequest(diff=diff_text))
+#     # Step 4: Docs
+#     docs = await generate_docs(DocsRequest(diff=diff_text))
 
-    logger.info(f"GitLab MR {mr_iid} full pipeline completed. Score: {review.score}")
+#     logger.info(f"GitLab MR {mr_iid} full pipeline completed. Score: {review.score}")
     
-    return {
-        "status": "success",
-        "repo": repo_name,
-        "mr_iid": mr_iid,
-        "review": review.model_dump(),
-        "multi_agent_review": multi.model_dump(),
-        "quality_gate": gate.model_dump(),
-        "documentation": docs.model_dump()
-    }
+#     return {
+#         "status": "success",
+#         "repo": repo_name,
+#         "mr_iid": mr_iid,
+#         "review": review.model_dump(),
+#         "multi_agent_review": multi.model_dump(),
+#         "quality_gate": gate.model_dump(),
+#         "documentation": docs.model_dump()
+#     }
 
 
 
