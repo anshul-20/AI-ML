@@ -7,6 +7,10 @@ import logging
 import time
 import uuid
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi.responses import JSONResponse
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,7 +33,7 @@ from app.feedback import handle_feedback, get_feedback_stats
 setup_logging()
 logger = logging.getLogger(__name__)
 
-AI_REVIEW_SCERET  = os.getenv("AI_REVIEW_SCERET")
+AI_REVIEW_SCERET = os.getenv("AI_REVIEW_SCERET")
 
 app = FastAPI(
     title="AI-Augmented CI/CD System",
