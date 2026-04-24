@@ -1,20 +1,44 @@
+"""
+AI-Augmented CI/CD System — FastAPI Application
+Features: Code Review, Quality Gate, Multi-Agent Review, Docs Generator, Feedback
+"""
+
 import logging
+import time
+import uuid
 import os
-from fastapi import FastAPI, HTTPException, Request
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
-from app.schemas import ReviewRequest, ReviewResponse
+from app.logger import setup_logging, set_request_id, log_event
+from app.schemas import (
+    ReviewRequest, ReviewResponse,
+    GateRequest, GateResponse,
+    MultiAgentRequest, MultiAgentResponse,
+    DocsRequest, DocsResponse,
+    FeedbackRequest, FeedbackResponse,
+)
 from app.reviewer import perform_review
-from app.utils import setup_logging
+from app.gate import evaluate_gate
+from app.multi_agent import run_multi_agent_review
+from app.docs_generator import generate_docs
+from app.feedback import handle_feedback, get_feedback_stats
 
 setup_logging()
 logger = logging.getLogger(__name__)
 
+AI_REVIEW_SCERET = os.getenv("AI_REVIEW_SCERET")
+
 app = FastAPI(
-    title="AI Code Review Agent",
-    description="LLM-powered code review service for CI/CD pipelines",
-    version="1.0.0",
+    title="AI-Augmented CI/CD System",
+    description="End-to-end AI code review pipeline powered entirely by OpenAI GPT: review → gate → docs → feedback",
+    version="2.0.0",
 )
 #this is a test comment to trigger the webhook and see if it works
 app.add_middleware(
@@ -23,188 +47,371 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+#-----------------Middleware--------------------------------------
+# @app.middleware("http")
+# async def token_auth_middleware(request: Request, call_next):
+#     # Skip auth for health check
+#     if request.url.path == "/health":
+#         return await call_next(request)
+    
+#     token = request.headers.get("X-API-Token")
+#     expected = os.getenv("AI_REVIEW_SCERET")
+    
+#     if expected and token != expected:
+#         return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
+#     return await call_next(request)
+@app.middleware("http")
+async def token_auth_middleware(request: Request, call_next):
+    # Always allow health checks (GitHub Actions checks this first)
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    # If token is configured on server, enforce it
+    if AI_REVIEW_SCERET:
+        incoming = request.headers.get("X-API-Token", "")
+        if incoming != AI_REVIEW_SCERET:
+            logger.warning("Unauthorized request | path=%s", request.url.path)
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    return await call_next(request)
 
 
-@app.get("/health")
+# ── Request correlation middleware ───────────────────────────────────────────
+
+@app.middleware("http")
+async def correlation_middleware(request: Request, call_next):
+    rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())[:8]
+    set_request_id(rid)
+    t0 = time.perf_counter()
+    response = await call_next(request)
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+    log_event(logger, "http_request",
+              method=request.method, path=request.url.path,
+              status=response.status_code, latency_ms=latency_ms)
+    response.headers["X-Request-ID"] = rid
+    return response
+
+
+# ── Health ───────────────────────────────────────────────────────────────────
+
+@app.get("/health", tags=["System"])
 def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "2.0.0"}
 
 
-@app.post("/review", response_model=ReviewResponse)
+# ── GitHub Integrations ──────────────────────────────────────────────────────
+
+async def post_github_pr_comment(repo_name: str, pr_number: int, comment_body: str):
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        logger.warning("No GITHUB_TOKEN set. Skipping PR comment.")
+        return
+        
+    url = f"https://api.github.com/repos/{repo_name}/issues/{pr_number}/comments"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, headers=headers, json={"body": comment_body})
+        if resp.status_code != 201:
+            logger.error(f"Failed to post comment: {resp.text}")
+
+async def set_github_commit_status(repo_name: str, commit_sha: str, state: str, description: str):
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        logger.warning("No GITHUB_TOKEN set. Skipping commit status.")
+        return
+        
+    url = f"https://api.github.com/repos/{repo_name}/statuses/{commit_sha}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    payload = {
+        "state": state,
+        "description": description[:140],
+        "context": "ai-code-review-agent"
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        if resp.status_code != 201:
+            logger.error(f"Failed to set status: {resp.text}")
+
+
+# ── Webhooks ─────────────────────────────────────────────────────────────────
+
+# @app.post("/webhook/github", tags=["Webhooks"])
+# async def github_webhook(request: Request, background_tasks: BackgroundTasks):
+#     """Handle GitHub Pull Request webhooks."""
+#     event = request.headers.get("x-github-event")
+#     if event != "pull_request":
+#         # Ignore other events or ping
+#         return {"detail": f"Ignoring event: {event}"}
+        
+#     payload = await request.json()
+#     action = payload.get("action")
+#     if action not in ["opened", "synchronize", "reopened"]:
+#         return {"detail": f"Ignoring PR action: {action}"}
+        
+#     repo_name = payload.get("repository", {}).get("full_name", "unknown/repo")
+#     pr_number = payload.get("pull_request", {}).get("number", 0)
+#     diff_url = payload.get("pull_request", {}).get("diff_url")
+#     commit_sha = payload.get("pull_request", {}).get("head", {}).get("sha")
+    
+#     if not diff_url:
+#         raise HTTPException(status_code=400, detail="No diff_url found in payload")
+        
+#     logger.info(f"GitHub Webhook received: repo={repo_name} pr={pr_number}")
+    
+#     async with httpx.AsyncClient() as client:
+#         resp = await client.get(diff_url)
+#         diff_text = resp.text
+        
+#     if not diff_text.strip():
+#         logger.warning(f"Empty diff for PR {pr_number}")
+#         return {"detail": "Empty diff"}
+
+#     # Step 1: Code review
+#     review = await perform_review(diff_text)
+    
+#     # Step 2: Multi-agent
+#     multi = await run_multi_agent_review(diff_text)
+    
+#     # Step 3: Quality gate
+#     gate_req = GateRequest(
+#         ai_score=review.score,
+#         issues=[i.model_dump() for i in review.issues],
+#         test_coverage=80.0,
+#         lint_errors=0,
+#     )
+#     gate = await evaluate_gate(gate_req)
+    
+#     # Step 4: Docs
+#     docs = await generate_docs(DocsRequest(diff=diff_text))
+
+#     logger.info(f"GitHub PR {pr_number} full pipeline completed. Score: {review.score}")
+    
+#     # Format Comment
+#     comment_body = f"## 🤖 AI Code Review\n\n"
+#     comment_body += f"**Score:** {review.score}/10.0\n"
+#     comment_body += f"**Quality Gate:** {gate.status}\n\n"
+#     comment_body += f"### 📊 Summary\n{review.summary}\n\n"
+    
+#     if review.issues:
+#         comment_body += "### 🚨 Issues\n"
+#         for issue in review.issues:
+#             comment_body += f"- **{issue.title}** ({issue.severity}): {issue.description}\n"
+            
+#     if review.strengths:
+#         comment_body += "### ✨ Strengths\n"
+#         for strength in review.strengths:
+#             comment_body += f"- {strength}\n"
+            
+#     comment_body += "\n---\n*Generated by AI-Augmented CI/CD System*"
+    
+#     # Post comment and status using background tasks
+#     background_tasks.add_task(post_github_pr_comment, repo_name, pr_number, comment_body)
+    
+#     if commit_sha:
+#         state = "success" if gate.status == "PASS" else "failure"
+#         desc = "AI Code Review Passed" if state == "success" else f"AI Code Review Failed: Score {review.score}"
+#         background_tasks.add_task(set_github_commit_status, repo_name, commit_sha, state, desc)
+    
+#     return {
+#         "status": "success",
+#         "repo": repo_name,
+#         "pr_number": pr_number,
+#         "review": review.model_dump(),
+#         "multi_agent_review": multi.model_dump(),
+#         "quality_gate": gate.model_dump(),
+#         "documentation": docs.model_dump()
+#     }
+
+
+# @app.post("/webhook/gitlab", tags=["Webhooks"])
+# async def gitlab_webhook(request: Request):
+#     """Handle GitLab Merge Request webhooks."""
+#     event = request.headers.get("x-gitlab-event")
+#     if event != "Merge Request Hook":
+#         return {"detail": f"Ignoring event: {event}"}
+        
+#     payload = await request.json()
+#     action = payload.get("object_attributes", {}).get("action")
+#     if action not in ["open", "update", "reopen"]:
+#         return {"detail": f"Ignoring MR action: {action}"}
+        
+#     repo_name = payload.get("project", {}).get("path_with_namespace", "unknown/repo")
+#     mr_iid = payload.get("object_attributes", {}).get("iid", 0)
+    
+#     web_url = payload.get("project", {}).get("web_url")
+#     if not web_url:
+#         raise HTTPException(status_code=400, detail="No web_url found in payload")
+        
+#     # GitLab diff URL: project_url/-/merge_requests/iid.diff
+#     diff_url = f"{web_url}/-/merge_requests/{mr_iid}.diff"
+    
+#     logger.info(f"GitLab Webhook received: repo={repo_name} mr={mr_iid}")
+    
+#     async with httpx.AsyncClient() as client:
+#         resp = await client.get(diff_url)
+#         diff_text = resp.text
+        
+#     if not diff_text.strip():
+#         logger.warning(f"Empty diff for MR {mr_iid}")
+#         return {"detail": "Empty diff"}
+
+#     # Step 1: Code review
+#     review = await perform_review(diff_text)
+    
+#     # Step 2: Multi-agent
+#     multi = await run_multi_agent_review(diff_text)
+    
+#     # Step 3: Quality gate
+#     gate_req = GateRequest(
+#         ai_score=review.score,
+#         issues=[i.model_dump() for i in review.issues],
+#         test_coverage=80.0,
+#         lint_errors=0,
+#     )
+#     gate = await evaluate_gate(gate_req)
+    
+#     # Step 4: Docs
+#     docs = await generate_docs(DocsRequest(diff=diff_text))
+
+#     logger.info(f"GitLab MR {mr_iid} full pipeline completed. Score: {review.score}")
+    
+#     return {
+#         "status": "success",
+#         "repo": repo_name,
+#         "mr_iid": mr_iid,
+#         "review": review.model_dump(),
+#         "multi_agent_review": multi.model_dump(),
+#         "quality_gate": gate.model_dump(),
+#         "documentation": docs.model_dump()
+#     }
+
+
+
+# ── Feature 1: Code Review ───────────────────────────────────────────────────
+
+@app.post("/review", response_model=ReviewResponse, tags=["Feature 1: Code Review"])
 async def review_pr(request: ReviewRequest):
-    logger.info(
-        "Incoming review request | repo=%s pr_id=%s diff_length=%d",
-        request.repo,
-        request.pr_id,
-        len(request.diff),
-    )
+    """Analyze a Git diff and return a structured AI code review."""
+    logger.info("review | repo=%s pr_id=%s diff_len=%d",
+                request.repo, request.pr_id, len(request.diff))
 
     if not request.diff.strip():
-        logger.warning("Empty diff received for repo=%s pr_id=%s", request.repo, request.pr_id)
         raise HTTPException(status_code=400, detail="Diff cannot be empty.")
 
     result = await perform_review(request.diff)
-    logger.info("Review completed | repo=%s pr_id=%s score=%.1f issues=%d",
-                request.repo, request.pr_id, result.score, len(result.issues))
+    logger.info("review done | score=%.1f issues=%d", result.score, len(result.issues))
     return result
 
 
-@app.post("/webhook/github")
-async def github_webhook(request: Request):
+# ── Feature 2: Quality Gate ───────────────────────────────────────────────────
+
+@app.post("/evaluate", response_model=GateResponse, tags=["Feature 2: Quality Gate"])
+async def evaluate(request: GateRequest):
+    """Evaluate PR against quality thresholds and return PASS/FAIL/REVIEW decision."""
+    logger.info("evaluate | score=%.1f coverage=%.1f lint=%d issues=%d",
+                request.ai_score, request.test_coverage,
+                request.lint_errors, len(request.issues))
+
+    result = await evaluate_gate(request)
+    logger.info("gate result | status=%s confidence=%.2f", result.status, result.confidence)
+    return result
+
+
+# ── Feature 3: Multi-Agent Review ────────────────────────────────────────────
+
+@app.post("/multi-review", response_model=MultiAgentResponse,
+          tags=["Feature 3: Multi-Agent Review"])
+async def multi_agent_review(request: MultiAgentRequest):
+    """Run three specialized agents (quality, security, performance) concurrently."""
+    if not request.diff.strip():
+        raise HTTPException(status_code=400, detail="Diff cannot be empty.")
+
+    logger.info("multi-review | diff_len=%d", len(request.diff))
+    result = await run_multi_agent_review(request.diff)
+    logger.info("multi-review done | final_score=%.2f", result.final_score)
+    return result
+
+
+# ── Feature 4: Documentation Generator ───────────────────────────────────────
+
+@app.post("/generate-docs", response_model=DocsResponse,
+          tags=["Feature 4: Docs Generator"])
+async def generate_documentation(request: DocsRequest):
+    """Generate changelog, API changes, and developer notes from a Git diff."""
+    if not request.diff.strip():
+        raise HTTPException(status_code=400, detail="Diff cannot be empty.")
+
+    logger.info("generate-docs | diff_len=%d", len(request.diff))
+    result = await generate_docs(request)
+    logger.info("docs done | changelog=%d api=%d notes=%d",
+                len(result.changelog), len(result.api_changes), len(result.developer_notes))
+    return result
+
+
+# ── Feature 6: Feedback Loop ──────────────────────────────────────────────────
+
+@app.post("/feedback", response_model=FeedbackResponse, tags=["Feature 6: Feedback"])
+async def submit_feedback(request: FeedbackRequest):
+    """Record developer feedback on AI review quality."""
+    logger.info("feedback | pr_id=%d accepted=%s fp=%s",
+                request.pr_id, request.accepted, request.false_positive)
+    return await handle_feedback(request)
+
+
+@app.get("/feedback/stats", tags=["Feature 6: Feedback"])
+def feedback_stats():
+    """Return aggregate statistics over all stored feedback."""
+    return get_feedback_stats()
+
+
+# ── Pipeline endpoint (integrate all features) ───────────────────────────────
+
+@app.post("/pipeline", tags=["Pipeline"])
+async def full_pipeline(request: ReviewRequest):
     """
-    Handle GitHub webhook payloads for testing locally.
-    Expects 'pull_request' events.
+    Run the full AI-powered CI/CD pipeline (all OpenAI):
+    /review → /multi-review → /evaluate → /generate-docs
+    Returns all outputs in a single response.
     """
-    event = request.headers.get("x-github-event", "ping")
-    if event == "ping":
-        return {"status": "pong"}
+    if not request.diff.strip():
+        raise HTTPException(status_code=400, detail="Diff cannot be empty.")
 
-    if event != "pull_request":
-        return {"status": "ignored", "reason": f"Event {event} not handled"}
+    logger.info("pipeline start | repo=%s pr_id=%s", request.repo, request.pr_id)
 
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    # Step 1: Code review
+    review = await perform_review(request.diff)
 
-    action = body.get("action")
-    if action not in ("opened", "synchronize", "reopened"):
-        return {"status": "ignored", "reason": f"Action {action} on PR ignored"}
+    # Step 2: Multi-agent (concurrent with gate prep)
+    multi = await run_multi_agent_review(request.diff)
 
-    pr = body.get("pull_request")
-    if not pr:
-        raise HTTPException(status_code=400, detail="Missing pull_request data")
+    # Step 3: Quality gate (uses review output)
+    gate_req = GateRequest(
+        ai_score=review.score,
+        issues=[i.model_dump() for i in review.issues],
+        test_coverage=80.0,   # Default — caller should provide real value
+        lint_errors=0,
+    )
+    gate = await evaluate_gate(gate_req)
 
-    repo = body.get("repository", {}).get("full_name", "unknown")
-    pr_id = pr.get("number")
-    diff_url = pr.get("diff_url")
+    # Step 4: Docs
+    docs = await generate_docs(DocsRequest(diff=request.diff))
 
-    if not diff_url:
-        raise HTTPException(status_code=400, detail="Missing diff_url")
+    log_event(logger, "pipeline_done",
+              repo=request.repo, pr_id=request.pr_id,
+              score=review.score, gate=gate.status)
 
-    logger.info("Received GitHub PR Webhook | repo=%s pr_id=%s action=%s", repo, pr_id, action)
-
-    # Fetch the diff
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.get(diff_url, follow_redirects=True)
-            resp.raise_for_status()
-            diff_text = resp.text
-        except Exception as e:
-            logger.error("Failed to fetch diff from %s: %s", diff_url, e)
-            raise HTTPException(status_code=500, detail="Could not retrieve diff")
-
-    if not diff_text.strip():
-        logger.warning("Empty diff at %s", diff_url)
-        return {"status": "ignored", "reason": "Empty diff"}
-
-    logger.info("Starting review for webhook diff (length=%d)", len(diff_text))
-    result = await perform_review(diff_text)
-    
-    github_token = os.getenv("GITHUB_TOKEN")
-    if github_token:
-        sha = pr.get("head", {}).get("sha", "")
-        
-        # Build comment Markdown
-        md = f"## AI Code Review (`{result.score}/10.0`)\n\n{result.summary}\n\n"
-        if result.issues:
-            md += "### Issues Found\n"
-            for issue in result.issues:
-                md += f"- **[{issue.severity.upper()}]** `{issue.file}`: **{issue.title}**\n"
-                md += f"  - _{issue.description}_\n"
-                md += f"  - **Fix:** {issue.suggestion}\n"
-        if result.strengths:
-            md += "\n### Strengths\n"
-            for st in result.strengths:
-                md += f"- {st}\n"
-
-        gh_headers = {
-            "Authorization": f"Bearer {github_token}",
-            "Accept": "application/vnd.github.v3+json",
-        }
-        
-        async with httpx.AsyncClient() as client:
-            # 1. Post Comment
-            comments_url = f"https://api.github.com/repos/{repo}/issues/{pr_id}/comments"
-            try:
-                await client.post(comments_url, json={"body": md}, headers=gh_headers)
-                logger.info("Posted Review Comment to PR #%s", pr_id)
-            except Exception as e:
-                logger.error("Failed to post comment to GitHub: %s", e)
-                
-            # 2. Post Status Check
-            if sha:
-                status_url = f"https://api.github.com/repos/{repo}/statuses/{sha}"
-                state = "success" if result.score >= 5.0 else "failure"
-                status_payload = {
-                    "state": state,
-                    "description": f"AI Code Review Score: {result.score}/10.0",
-                    "context": "ai-code-review-agent"
-                }
-                try:
-                    await client.post(status_url, json=status_payload, headers=gh_headers)
-                    logger.info("Posted Status '%s' for commit %s", state, sha)
-                except Exception as e:
-                    logger.error("Failed to post status check: %s", e)
-
-    logger.info("Webhook review completed | score=%.1f issues=%d", result.score, len(result.issues))
-    return {"status": "reviewed", "review": result}
-
-
-@app.post("/webhook/gitlab")
-async def gitlab_webhook(request: Request):
-    """
-    Handle GitLab webhook payloads for testing locally.
-    Expects 'Merge Request Hook' events.
-    """
-    event = request.headers.get("x-gitlab-event", "ping")
-    if event == "ping":
-        return {"status": "pong"}
-
-    if event != "Merge Request Hook":
-        return {"status": "ignored", "reason": f"Event {event} not handled"}
-
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-
-    obj_attrs = body.get("object_attributes", {})
-    action = obj_attrs.get("action")
-    
-    # Gitlab uses "open", "update", "reopen"
-    if action not in ("open", "update", "reopen"):
-        return {"status": "ignored", "reason": f"Action {action} on MR ignored"}
-
-    project = body.get("project", {})
-    repo = project.get("path_with_namespace", "unknown")
-    mr_iid = obj_attrs.get("iid")
-    web_url = project.get("web_url")
-
-    if not mr_iid or not web_url:
-        raise HTTPException(status_code=400, detail="Missing MR iid or project web_url")
-
-    logger.info("Received GitLab MR Webhook | repo=%s mr_iid=%s action=%s", repo, mr_iid, action)
-
-    # GitLab natively supports appending .diff to the MR URL to fetch the raw diff
-    diff_url = f"{web_url}/-/merge_requests/{mr_iid}.diff"
-
-    # Fetch the diff
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.get(diff_url, follow_redirects=True)
-            resp.raise_for_status()
-            diff_text = resp.text
-        except Exception as e:
-            logger.error("Failed to fetch diff from %s: %s", diff_url, e)
-            raise HTTPException(status_code=500, detail="Could not retrieve diff. (Note: Private GitLab repos require an Access Token)")
-
-    if not diff_text.strip():
-        logger.warning("Empty diff at %s", diff_url)
-        return {"status": "ignored", "reason": "Empty diff"}
-
-    logger.info("Starting review for GitLab webhook diff (length=%d)", len(diff_text))
-    result = await perform_review(diff_text)
-    
-    logger.info("GitLab Webhook review completed | score=%.1f issues=%d", result.score, len(result.issues))
-    return {"status": "reviewed", "review": result}
+    return {
+        "repo": request.repo,
+        "pr_id": request.pr_id,
+        "review": review.model_dump(),
+        "multi_agent_review": multi.model_dump(),
+        "quality_gate": gate.model_dump(),
+        "documentation": docs.model_dump(),
+    }
