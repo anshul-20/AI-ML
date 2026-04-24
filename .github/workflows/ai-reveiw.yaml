@@ -1,0 +1,158 @@
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  ai-review:
+    name: Run AI Review Pipeline
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout code
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history needed for diff
+
+      # Step 2: Extract the diff
+      - name: Extract PR diff
+        id: diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD > pr.diff
+          echo "diff_size=$(wc -c < pr.diff)" >> $GITHUB_OUTPUT
+
+      # Step 3: Verify AI service is up
+      - name: Health check
+        run: |
+          curl -f ${{ secrets.AI_REVIEW_URL }}/health || exit 1
+
+      # Step 4: Run the full AI pipeline
+      - name: Run AI pipeline
+        id: ai_review
+        run: |
+          DIFF_CONTENT=$(cat pr.diff)
+          
+          RESPONSE=$(curl -s -X POST "${{ secrets.AI_REVIEW_URL }}/pipeline" \
+            -H "Content-Type: application/json" \
+            -H "X-API-Token: ${{ secrets.AI_REVIEW_TOKEN }}" \
+            -d "{
+              \"repo\": \"${{ github.repository }}\",
+              \"pr_id\": ${{ github.event.pull_request.number }},
+              \"diff\": $(echo "$DIFF_CONTENT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+            }")
+          
+          echo "response=$RESPONSE" >> $GITHUB_OUTPUT
+          
+          # Extract gate status
+          GATE=$(echo $RESPONSE | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['quality_gate']['status'])")
+          SCORE=$(echo $RESPONSE | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['review']['score'])")
+          
+          echo "gate=$GATE" >> $GITHUB_OUTPUT
+          echo "score=$SCORE" >> $GITHUB_OUTPUT
+
+      # Step 5: Post review as PR comment
+      - name: Post review comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const response = JSON.parse('${{ steps.ai_review.outputs.response }}');
+            const review = response.review;
+            const gate = response.quality_gate;
+            const docs = response.documentation;
+            const multi = response.multi_agent_review;
+
+            const statusEmoji = { PASS: '✅', FAIL: '❌', REVIEW: '⚠️' };
+            const severityEmoji = { critical: '🔴', high: '🟠', medium: '🟡', low: '🔵' };
+
+            let issueLines = review.issues.map(i =>
+              `${severityEmoji[i.severity] || '⚪'} **${i.title}** \`${i.severity}\`\n` +
+              `   - **File:** \`${i.file}\`\n` +
+              `   - **Problem:** ${i.description}\n` +
+              `   - **Fix:** ${i.suggestion}`
+            ).join('\n\n');
+
+            let strengthLines = review.strengths.map(s => `- ✅ ${s}`).join('\n');
+            let changelogLines = docs.changelog.map(c => `- ${c}`).join('\n');
+
+            const body = `## 🤖 AI Code Review
+
+            **Score:** ${review.score}/10 &nbsp; | &nbsp; **Gate:** ${statusEmoji[gate.status]} ${gate.status} &nbsp; | &nbsp; **Confidence:** ${(gate.confidence * 100).toFixed(0)}%
+
+            ---
+
+            ### 📊 Agent Scores
+            | Agent | Score |
+            |-------|-------|
+            | Code Quality | ${multi.code_quality.score}/10 |
+            | Security | ${multi.security.score}/10 |
+            | Performance | ${multi.performance.score}/10 |
+
+            ---
+
+            ### 📋 Summary
+            ${review.summary}
+
+            ---
+
+            ${issueLines ? `### 🚨 Issues Found\n\n${issueLines}` : '### 🚨 Issues Found\nNo issues detected.'}
+
+            ---
+
+            ${strengthLines ? `### 💪 Strengths\n${strengthLines}` : ''}
+
+            ---
+
+            ### 📄 Auto-Generated Changelog
+            ${changelogLines || 'No changelog entries generated.'}
+
+            ---
+
+            ### 🚦 Gate Decision
+            **${gate.status}** — ${gate.reasons.join(', ')}
+
+            <sub>🤖 Powered by AI Review System | PR #${{ github.event.pull_request.number }}</sub>`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      # Step 6: Block merge if FAIL
+      - name: Enforce gate decision
+        run: |
+          GATE="${{ steps.ai_review.outputs.gate }}"
+          SCORE="${{ steps.ai_review.outputs.score }}"
+          
+          echo "Gate: $GATE | Score: $SCORE"
+          
+          if [ "$GATE" = "FAIL" ]; then
+            echo "❌ AI Quality Gate FAILED. PR cannot be merged."
+            echo "Fix the critical issues flagged above and push again."
+            exit 1
+          elif [ "$GATE" = "REVIEW" ]; then
+            echo "⚠️ AI Quality Gate requires human review."
+            exit 0   # doesn't block, but human reviewer is notified via comment
+          else
+            echo "✅ AI Quality Gate PASSED."
+            exit 0
+          fi
+
+      # Step 7: Auto-approve if PASS (optional)
+      - name: Auto-approve on PASS
+        if: steps.ai_review.outputs.gate == 'PASS'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.pulls.createReview({
+              pull_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event: 'APPROVE',
+              body: '✅ Auto-approved by AI Review System. Score: ${{ steps.ai_review.outputs.score }}/10'
+            });
