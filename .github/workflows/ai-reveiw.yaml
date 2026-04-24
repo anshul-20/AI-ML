@@ -34,20 +34,28 @@ jobs:
         run: |
           DIFF_CONTENT=$(cat pr.diff)
           
-          RESPONSE=$(curl -s -X POST "${{ secrets.AI_REVIEW_URL }}/pipeline" \
+          RESPONSE=$(curl -w "\n%{http_code}" -s -X POST "${{ secrets.AI_REVIEW_URL }}/pipeline" \
             -H "Content-Type: application/json" \
-            -H "X-API-Token: ${{ secrets.AI_REVIEW_TOKEN }}" \
+            -H "X-API-Token: ${{ secrets.AI_REVIEW_SCERET }}" \
             -d "{
               \"repo\": \"${{ github.repository }}\",
               \"pr_id\": ${{ github.event.pull_request.number }},
               \"diff\": $(echo "$DIFF_CONTENT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
             }")
           
-          echo "response=$RESPONSE" >> $GITHUB_OUTPUT
+          HTTP_STATUS=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n-1)
+
+          echo "response=$BODY" >> $GITHUB_OUTPUT
+          
+          if [ "$HTTP_STATUS" -ne 200 ]; then
+            echo "::error::API request failed with status $HTTP_STATUS. Response: $BODY"
+            exit 1
+          fi
           
           # Extract gate status
-          GATE=$(echo $RESPONSE | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['quality_gate']['status'])")
-          SCORE=$(echo $RESPONSE | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['review']['score'])")
+          GATE=$(echo $BODY | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['quality_gate']['status'])")
+          SCORE=$(echo $BODY | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['review']['score'])")
           
           echo "gate=$GATE" >> $GITHUB_OUTPUT
           echo "score=$SCORE" >> $GITHUB_OUTPUT
