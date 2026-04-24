@@ -1,40 +1,33 @@
+"""
+Utility helpers: JSON parsing and fallback review.
+Logging setup lives in app.logger.
+"""
 import json
 import logging
 import re
-import sys
 
-
-def setup_logging() -> None:
-    """Configure structured logging for the application."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
+# Re-export so main.py can still do: from app.utils import setup_logging
+from app.logger import setup_logging  # noqa: F401
 
 
 def parse_llm_json(raw: str) -> dict:
     """
     Robustly parse JSON from LLM output.
-    Handles markdown fences, leading/trailing text, and minor formatting issues.
+    Handles markdown fences, surrounding text, and minor formatting quirks.
     """
     logger = logging.getLogger(__name__)
 
-    # Step 1: try direct parse
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
 
-    # Step 2: strip markdown code fences
-    cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip()
+    cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    # Step 3: extract first {...} block
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
         try:
@@ -42,14 +35,14 @@ def parse_llm_json(raw: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    logger.error("Failed to parse LLM output as JSON. Raw response:\n%s", raw[:500])
+    logger.error("Failed to parse LLM JSON. Raw snippet:\n%s", raw[:500])
     raise ValueError("LLM returned unparseable JSON.")
 
 
 def fallback_review() -> dict:
-    """Return a safe fallback response when LLM parsing fails completely."""
+    """Safe fallback when LLM call or parsing fails completely."""
     return {
-        "summary": "Review could not be completed due to a parsing error.",
+        "summary": "Review could not be completed due to an internal error.",
         "score": 0.0,
         "issues": [],
         "strengths": [],
