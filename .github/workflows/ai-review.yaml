@@ -36,7 +36,7 @@ jobs:
           
           RESPONSE=$(curl -w "\n%{http_code}" -s -X POST "${{ secrets.AI_REVIEW_URL }}/pipeline" \
             -H "Content-Type: application/json" \
-            -H "X-API-Token: ${{ secrets.AI_REVIEW_SCERET }}" \
+            -H "X-API-Token: ${{ secrets.AI_REVIEW_SECRET }}" \
             -d "{
               \"repo\": \"${{ github.repository }}\",
               \"pr_id\": ${{ github.event.pull_request.number }},
@@ -46,7 +46,9 @@ jobs:
           HTTP_STATUS=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | head -n-1)
 
-          echo "response=$BODY" >> $GITHUB_OUTPUT
+          echo "response<<RESPONSE_EOF" >> $GITHUB_OUTPUT
+          echo "$BODY" >> $GITHUB_OUTPUT
+          echo "RESPONSE_EOF" >> $GITHUB_OUTPUT
           
           if [ "$HTTP_STATUS" -ne 200 ]; then
             echo "::error::API request failed with status $HTTP_STATUS. Response: $BODY"
@@ -66,7 +68,8 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const response = JSON.parse('${{ steps.ai_review.outputs.response }}');
+            const rawResponse = `${{ steps.ai_review.outputs.response }}`;
+            const response = JSON.parse(rawResponse);
             const review = response.review;
             const gate = response.quality_gate;
             const docs = response.documentation;
@@ -85,45 +88,47 @@ jobs:
             let strengthLines = review.strengths.map(s => `- ✅ ${s}`).join('\n');
             let changelogLines = docs.changelog.map(c => `- ${c}`).join('\n');
 
-            const body = `## 🤖 AI Code Review
+            const body = [
+              `## 🤖 AI Code Review`,
+              ``,
+              `**Score:** ${review.score}/10 &nbsp; | &nbsp; **Gate:** ${statusEmoji[gate.status]} ${gate.status} &nbsp; | &nbsp; **Confidence:** ${(gate.confidence * 100).toFixed(0)}%`,
+              ``,
+              `---`,
+              ``,
+              `### 📊 Agent Scores`,
+              `| Agent | Score |`,
+              `|-------|-------|`,
+              `| Code Quality | ${multi.code_quality.score}/10 |`,
+              `| Security | ${multi.security.score}/10 |`,
+              `| Performance | ${multi.performance.score}/10 |`,
+              ``,
+              `---`,
+              ``,
+              `### 📋 Summary`,
+              review.summary,
+              ``,
+              `---`,
+              ``,
+              issueLines ? `### 🚨 Issues Found\n\n${issueLines}` : `### 🚨 Issues Found\nNo issues detected.`,
+              ``,
+              `---`,
+              ``,
+              strengthLines ? `### 💪 Strengths\n${strengthLines}` : ``,
+              ``,
+              `---`,
+              ``,
+              `### 📄 Auto-Generated Changelog`,
+              changelogLines || `No changelog entries generated.`,
+              ``,
+              `---`,
+              ``,
+              `### 🚦 Gate Decision`,
+              `**${gate.status}** — ${gate.reasons.join(', ')}`,
+              ``,
+              `<sub>🤖 Powered by AI Review System | PR #${{ github.event.pull_request.number }}</sub>`,
+            ].join('\n');
 
-            **Score:** ${review.score}/10 &nbsp; | &nbsp; **Gate:** ${statusEmoji[gate.status]} ${gate.status} &nbsp; | &nbsp; **Confidence:** ${(gate.confidence * 100).toFixed(0)}%
-
-            ---
-
-            ### 📊 Agent Scores
-            | Agent | Score |
-            |-------|-------|
-            | Code Quality | ${multi.code_quality.score}/10 |
-            | Security | ${multi.security.score}/10 |
-            | Performance | ${multi.performance.score}/10 |
-
-            ---
-
-            ### 📋 Summary
-            ${review.summary}
-
-            ---
-
-            ${issueLines ? `### 🚨 Issues Found\n\n${issueLines}` : '### 🚨 Issues Found\nNo issues detected.'}
-
-            ---
-
-            ${strengthLines ? `### 💪 Strengths\n${strengthLines}` : ''}
-
-            ---
-
-            ### 📄 Auto-Generated Changelog
-            ${changelogLines || 'No changelog entries generated.'}
-
-            ---
-
-            ### 🚦 Gate Decision
-            **${gate.status}** — ${gate.reasons.join(', ')}
-
-            <sub>🤖 Powered by AI Review System | PR #${{ github.event.pull_request.number }}</sub>`;
-
-            github.rest.issues.createComment({
+            await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
