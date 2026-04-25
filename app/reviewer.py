@@ -1,157 +1,29 @@
-import asyncio
+"""
+Feature 1: AI Code Review Agent — powered by OpenAI GPT.
+Accepts a Git diff, sends it to OpenAI, returns a structured JSON review.
+No Anthropic/Claude dependency.
+"""
+
 import logging
-import os
 from typing import Optional
 
-import httpx
-
+from app.logger import log_event
+from app.openai_client import call_openai, parse_json_response
 from app.prompt import build_prompt
 from app.schemas import ReviewResponse
-from app.utils import parse_llm_json, fallback_review
+from app.utils import fallback_review
 
 logger = logging.getLogger(__name__)
 
-OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-MAX_RETRIES = 3
-RETRY_DELAY = 2.0  # seconds
-
-
-async def call_llm(diff: str) -> dict:
-    """
-    Call the LLM (OpenAI) with the review prompt.
-    Falls back to a mock response if no API key is configured.
-    Retries up to MAX_RETRIES times on transient failures.
-    """
-    prompt = build_prompt(diff)
-    logger.info("Prompt built | length=%d chars", len(prompt))
-
-    if not OPENAI_API_KEY:
-        logger.warning("No OPENAI_API_KEY set \u2014 using mock LLM response.")
-        return _mock_llm_response(diff)
-
-    last_error: Optional[Exception] = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            result = await _call_openai(prompt)
-            return result
-        except Exception as exc:
-            last_error = exc
-            logger.warning("LLM call attempt %d/%d failed: %s", attempt, MAX_RETRIES, exc)
-            if attempt < MAX_RETRIES:
-                await asyncio.sleep(RETRY_DELAY * attempt)
-
-    logger.error("All LLM retries exhausted. Last error: %s", last_error)
-    return fallback_review()
-
-
-async def _call_openai(prompt: str) -> dict:
-    """Make the HTTP call to the OpenAI chat completions API."""
-    payload = {
-        "model": OPENAI_MODEL,
-        "response_format": {"type": "json_object"},
-        "temperature": 0.0,
-        "messages": [
-            {"role": "system", "content": "You must output valid STRICT JSON matching the required schema. Do not output markdown, just the JSON."},
-            {"role": "user", "content": prompt}
-        ],
-    }
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            json=payload,
-            headers=headers,
-        )
-
-    if response.status_code != 200:
-        raise RuntimeError(f"OpenAI API error {response.status_code}: {response.text[:300]}")
-
-    data = response.json()
-    raw_text = data["choices"][0]["message"]["content"]
-    logger.debug("Raw LLM response:\n%s", raw_text[:1000])
-
-    return parse_llm_json(raw_text)
-
-
-def _mock_llm_response(diff: str) -> dict:
-    """
-    Deterministic mock response for testing without an API key.
-    Detects obvious patterns (SQL injection, hardcoded secrets) for realistic output.
-    """
-    issues = []
-    strengths = []
-    score = 8.5
-
-    diff_lower = diff.lower()
-
-    # SQL injection detection
-    if "select" in diff_lower and '"+' in diff or "' +" in diff or "query(" in diff_lower:
-        issues.append({
-            "type": "security",
-            "severity": "critical",
-            "file": _extract_file_from_diff(diff),
-            "line": None,
-            "title": "SQL Injection Vulnerability",
-            "description": (
-                "String concatenation is used to build a SQL query, which allows "
-                "attackers to manipulate the query structure via user-controlled input."
-            ),
-            "suggestion": (
-                "Use parameterized queries or an ORM. "
-                "E.g., db.query('SELECT * FROM users WHERE id = %s', (id,))"
-            ),
-        })
-        score = 2.0
-
-    # Hardcoded secret detection
-    if any(kw in diff_lower for kw in ("password =", "secret =", "api_key =", "token =")):
-        issues.append({
-            "type": "security",
-            "severity": "critical",
-            "file": _extract_file_from_diff(diff),
-            "line": None,
-            "title": "Hardcoded Secret",
-            "description": "A secret or credential appears to be hardcoded in the source.",
-            "suggestion": "Move secrets to environment variables or a secrets manager.",
-        })
-        score = min(score, 2.0)
-
-    # Missing type hints
-    if "def " in diff and "->" not in diff:
-        issues.append({
-            "type": "style",
-            "severity": "low",
-            "file": _extract_file_from_diff(diff),
-            "line": None,
-            "title": "Missing Type Hints",
-            "description": "Function definitions lack return type annotations.",
-            "suggestion": "Add type hints for all function parameters and return values.",
-        })
-        score = min(score, 7.5)
-
-    if not issues:
-        strengths = ["No obvious issues detected.", "Code appears clean and readable."]
-        score = 9.0
-
-    return {
-        "summary": (
-            "Mock review: detected patterns analyzed. "
-            f"{len(issues)} issue(s) found. "
-            "Enable OPENAI_API_KEY for a full AI-powered review."
-        ),
-        "score": score,
-        "issues": issues,
-        "strengths": strengths,
-    }
+# System prompt keeps the LLM strictly in "code reviewer" mode
+_REVIEW_SYSTEM = (
+    "You are a senior staff-level software engineer performing a professional code review. "
+    "Return ONLY valid JSON. No markdown, no commentary outside JSON."
+)
 
 
 def _extract_file_from_diff(diff: str) -> str:
-    """Try to extract the first modified filename from a git diff."""
+    """Extract the first modified filename from a git diff header."""
     for line in diff.splitlines():
         if line.startswith("+++ b/"):
             return line[6:]
@@ -162,15 +34,120 @@ def _extract_file_from_diff(diff: str) -> str:
     return "unknown"
 
 
+def _mock_review(diff: str) -> dict:
+    """
+    Heuristic mock review used when OPENAI_API_KEY is not set.
+    Detects SQL injection, hardcoded secrets, and missing type hints.
+    """
+    issues = []
+    score = 8.5
+    diff_lower = diff.lower()
+    fname = _extract_file_from_diff(diff)
+
+    # SQL injection
+    if ("select" in diff_lower and '"+' in diff) or "' +" in diff or "query(" in diff_lower:
+        issues.append({
+            "type": "security",
+            "severity": "critical",
+            "file": fname,
+            "line": None,
+            "title": "SQL Injection Vulnerability",
+            "description": (
+                "String concatenation is used to build a SQL query. "
+                "Attackers can manipulate the query structure via user-controlled input."
+            ),
+            "suggestion": (
+                "Use parameterized queries or an ORM. "
+                "Example: db.query('SELECT * FROM users WHERE id = %s', (id,))"
+            ),
+        })
+        score = 2.0
+
+    # Hardcoded secrets
+    if any(kw in diff_lower for kw in ("password =", "secret =", "api_key =", "token =")):
+        issues.append({
+            "type": "security",
+            "severity": "critical",
+            "file": fname,
+            "line": None,
+            "title": "Hardcoded Secret",
+            "description": "A credential or secret appears to be hardcoded in the source.",
+            "suggestion": "Move secrets to environment variables or a secrets manager (e.g. AWS Secrets Manager).",
+        })
+        score = min(score, 2.0)
+
+    # Missing type hints
+    if "def " in diff and "->" not in diff:
+        issues.append({
+            "type": "style",
+            "severity": "low",
+            "file": fname,
+            "line": None,
+            "title": "Missing Type Hints",
+            "description": "Function definitions lack return type and/or parameter annotations.",
+            "suggestion": "Add type annotations: def get_user(id: int) -> User:",
+        })
+        score = min(score, 7.5)
+
+    strengths = [] if issues else [
+        "No obvious issues detected.",
+        "Code appears clean and readable.",
+    ]
+    if not issues:
+        score = 9.0
+
+    return {
+        "summary": (
+            f"Mock review — {len(issues)} issue(s) detected via pattern analysis. "
+            "Set OPENAI_API_KEY for a full GPT-powered review."
+        ),
+        "score": score,
+        "issues": issues,
+        "strengths": strengths,
+    }
+
+
+async def call_llm(diff: str) -> dict:
+    """
+    Build the review prompt and call OpenAI.
+    Falls back to heuristic mock when no API key is configured.
+    Retry logic is handled inside openai_client.call_openai.
+    """
+    prompt = build_prompt(diff)
+    log_event(logger, "review_prompt_built", length=len(prompt))
+
+    raw = await call_openai(prompt, system=_REVIEW_SYSTEM, max_tokens=2048)
+
+    if not raw:
+        logger.warning("No OpenAI response — using mock review (OPENAI_API_KEY not set?)")
+        return _mock_review(diff)
+
+    try:
+        result = parse_json_response(raw)
+        log_event(logger, "review_parsed",
+                  score=result.get("score"), issues=len(result.get("issues", [])))
+        return result
+    except Exception as exc:
+        logger.error("Failed to parse OpenAI review response: %s", exc)
+        return fallback_review()
+
+
 async def perform_review(diff: str) -> ReviewResponse:
-    """Orchestrate the full review: call LLM \u2192 validate \u2192 return response."""
+    """
+    Full review pipeline:
+      1. Build prompt
+      2. Call OpenAI (with retry + mock fallback)
+      3. Validate and clamp score
+      4. Return typed ReviewResponse
+    """
     raw_result = await call_llm(diff)
-    logger.info("Parsed review | score=%.1f issues=%d strengths=%d",
-                raw_result.get("score", 0),
+
+    # Clamp score to valid [0, 10] range
+    raw_result["score"] = max(0.0, min(10.0, float(raw_result.get("score", 0))))
+
+    logger.info("review_complete | score=%.1f issues=%d strengths=%d",
+                raw_result["score"],
                 len(raw_result.get("issues", [])),
                 len(raw_result.get("strengths", [])))
-
-    # Clamp score to valid range
-    raw_result["score"] = max(0.0, min(10.0, float(raw_result.get("score", 0))))
 
     return ReviewResponse(**raw_result)
