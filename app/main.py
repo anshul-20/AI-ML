@@ -33,7 +33,7 @@ from app.feedback import handle_feedback, get_feedback_stats
 setup_logging()
 logger = logging.getLogger(__name__)
 
-AI_REVIEW_SCERET = os.getenv("AI_REVIEW_SCERET")
+AI_REVIEW_SECRET = os.getenv("AI_REVIEW_SECRET")
 
 app = FastAPI(
     title="AI-Augmented CI/CD System",
@@ -55,7 +55,7 @@ app.add_middleware(
 #         return await call_next(request)
     
 #     token = request.headers.get("X-API-Token")
-#     expected = os.getenv("AI_REVIEW_SCERET")
+#     expected = os.getenv("AI_REVIEW_SECRET")
     
 #     if expected and token != expected:
 #         return JSONResponse({"error": "Unauthorized"}, status_code=401)
@@ -68,9 +68,9 @@ async def token_auth_middleware(request: Request, call_next):
         return await call_next(request)
 
     # If token is configured on server, enforce it
-    if AI_REVIEW_SCERET:
+    if AI_REVIEW_SECRET:
         incoming = request.headers.get("X-API-Token", "")
-        if incoming != AI_REVIEW_SCERET:
+        if incoming != AI_REVIEW_SECRET:
             logger.warning("Unauthorized request | path=%s", request.url.path)
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
 

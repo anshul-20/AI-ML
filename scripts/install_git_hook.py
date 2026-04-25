@@ -31,9 +31,10 @@ EOF
 )
 
 # Call the local API
-RESPONSE=$(curl -s -X POST http://127.0.0.1:8000/review \
+RESPONSE=$(echo "$PAYLOAD" | curl -s -X POST http://127.0.0.1:8001/review \
     -H "Content-Type: application/json" \
-    -d "$PAYLOAD")
+    -H "X-API-Token: 0d1ed11b2b8e1e39e00f2a63024713474949194b964dfa3cc54bef2515c3f796" \
+    -d @-)
 
 if [ -z "$RESPONSE" ]; then
     echo "AI Code Review Agent is unreachable. Ensure 'uvicorn app.main:app' is running."
@@ -75,7 +76,7 @@ def main():
     st = os.stat(hook_path)
     os.chmod(hook_path, st.st_mode | stat.S_IEXEC)
 
-    print(f"\u2705 Successfully installed Git pre-commit hook at: {hook_path}")
+    print(f"[SUCCESS] Successfully installed Git pre-commit hook at: {hook_path}")
     print("\nNext steps:")
     print("  1. Make sure your local review server is running: `uvicorn app.main:app --reload`")
     print("  2. Perform a `git commit`. The hook will analyze staged files and evaluate your code.")
