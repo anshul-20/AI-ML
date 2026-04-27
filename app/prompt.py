@@ -80,7 +80,7 @@ def perform_review(diff: str) -> dict:
         ]
     }
 
-
+print`("Review function defined")  # Debug statement`
 def build_prompt(diff: str) -> str:
     """Build the review prompt, truncating diff if necessary."""
     if len(diff) > MAX_DIFF_CHARS:
