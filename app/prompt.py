@@ -52,7 +52,35 @@ INPUT DIFF:
 
 MAX_DIFF_CHARS = 12_000
 
+print("Prompt template and builder loaded")  # Debug statement
 
+def perform_review(diff: str) -> dict:
+    """Perform the code review by calling the LLM with the built prompt."""
+    prompt = build_prompt(diff)
+    # Here you would call your LLM API with the prompt and parse the response
+    # For example:
+    # response = llm_api_call(prompt)
+    # return parse_llm_response(response)
+    return {
+        "summary": "This is a placeholder summary.",
+        "score": 7.5,
+        "issues": [
+            {
+                "type": "bug",
+                "severity": "medium",
+                "file": "example.py",
+                "line": 42,
+                "title": "Potential null pointer dereference",
+                "description": "The variable 'data' could be null here, which may cause a crash.",
+                "suggestion": "Add a null check before accessing 'data'."
+            }
+        ],
+        "strengths": [
+            "Good use of functions to modularize code."
+        ]
+    }
+
+print`("Review function defined")  # Debug statement`
 def build_prompt(diff: str) -> str:
     """Build the review prompt, truncating diff if necessary."""
     if len(diff) > MAX_DIFF_CHARS:
