@@ -1,0 +1,20 @@
+[
+  {
+    "feedback_id": "89e5da8e",
+    "timestamp": "2026-04-27T06:39:16Z",
+    "pr_id": 42,
+    "accepted": true,
+    "false_positive": false,
+    "comments": null,
+    "ai_output": {}
+  },
+  {
+    "feedback_id": "8438d637",
+    "timestamp": "2026-04-27T06:39:16Z",
+    "pr_id": 43,
+    "accepted": false,
+    "false_positive": true,
+    "comments": "missed edge case",
+    "ai_output": {}
+  }
+]
